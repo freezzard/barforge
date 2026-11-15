@@ -1,69 +1,67 @@
-// BARFORGE — an active-bar Donchian trend bot for cbBTC/USDC minute bars.
+// BARFORGE — a fee-aware oversold-bounce bot for cbBTC/USDC minute bars.
 //
-// This pool is stale: its price moves only when someone trades it, so most
-// one-minute bars are flat and any indicator averaged over raw minutes is
-// mostly averaging a frozen price. Every indicator here therefore runs on
-// ACTIVE bars only — bars whose close differs from the previous close.
-// Flat bars update nothing.
+// The market it trades is a thin on-chain pool: the price is stale for long
+// stretches and moves in steps when someone trades the pool, and every fill
+// pays the 4 bps fee, 2 bps of modelled slippage and constant-product impact
+// against the bar's depth — roughly a quarter of a percent for a full-size
+// round trip. Churn is death here (the house EMA-cross bleeds on exactly
+// that), so this bot trades rarely and only when the expected move dwarfs
+// the cost of the round trip:
 //
-// The bot is a breakout trend follower with cost discipline:
-//   - Entry (decided on an active bar, filled at the next bar's open):
-//     the close breaks the highest high of the last DONCHIAN_K active
-//     bars, EMA_fast sits above EMA_slow on active closes, and the close
-//     already stands MIN_RANGE_BPS off the channel's low — a move smaller
-//     than that cannot pay the round trip (the 4 bps fee and 2 bps
-//     slippage each way, plus impact), which the entry also estimates
-//     from the live depth and refuses when it exceeds MAX_COST_BPS.
-//   - Size: TARGET_FRACTION_BPS of equity, never more than
-//     DEPTH_CAP_BPS of the pool's depth at the latest close, so an order
-//     stays a small share of the pool it moves.
-//   - Exit: a trailing stop TRAIL_MULT active-bar ATRs under the best
-//     close since entry, or the close back under EMA_slow. After an exit
-//     the bot rests COOLDOWN_BARS batches.
-//   - Hard guard: an equity drawdown of DD_GUARD_BPS from its peak exits
-//     everything and locks entries for the rest of the window (the race
-//     ranks a bot over the 25% drawdown bar below everyone under it).
-//   - Guaranteed trade: if no position has ever been filled by batch
-//     FALLBACK_START_SEQ, the bot buys FALLBACK_FRACTION_BPS of equity on
-//     the next active bar with a healthy cost estimate and sells it
-//     FALLBACK_HOLD_BARS batches later — the race bar needs a trade, and
-//     a bot that never found its signal still owes one.
+//   - It waits for a real sell-off: the latest close at least
+//     ENTRY_DRAWDOWN_BPS below the highest close of the last
+//     PEAK_LOOKBACK_BARS bars.
+//   - It does not catch the knife: the close must already have bounced
+//     ENTRY_BOUNCE_BPS off the lowest close of the last LOW_LOOKBACK_BARS
+//     bars, so the slide has visibly stalled before it buys.
+//   - It buys POSITION_FRACTION_BPS of the cash it holds, once, and then
+//     manages the one position: out at TAKE_PROFIT_BPS over its cost, out
+//     at STOP_LOSS_BPS under it, out on a TRAIL_BPS give-back once the
+//     trade has run TRAIL_ARM_BPS into profit, and out after
+//     TIME_STOP_BARS bars whatever happened.
+//   - After any exit it rests COOLDOWN_BARS bars, and once the equity has
+//     fallen DRAWDOWN_BRAKE_BPS from its peak it opens nothing new (the
+//     race ranks a bot that misses the 25% drawdown bar below everyone
+//     who meets it; the brake keeps a bad day from ever nearing that).
 //
-// Indicator math is float64 on + - * / alone (each correctly rounded, as
-// the house baselines rely on), so two runs over the same bars answer
-// byte for byte. All tunables are the named constants below, one per
-// line, so a parameter sweep only ever rewrites this block.
+// Every ratio test is exact bigint arithmetic on the integer closes, so
+// two runs over the same bars give the same orders byte for byte. All
+// tunables are the named constants below, in one place, so a parameter
+// sweep only ever rewrites this block.
 
 import { runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
-// ---- the strategy's constants (sweep only ever rewrites this block) ----
-/** Active bars in the Donchian channel. */
-const DONCHIAN_K = 12;
-/** EMA spans on active closes. */
-const EMA_FAST_SPAN = 5;
-const EMA_SLOW_SPAN = 15;
-/** Wilder ATR period on active bars. */
-const ATR_PERIOD = 14;
-/** The close must stand at least this far off the channel low, in bps. */
-const MIN_RANGE_BPS = 45;
-/** Entries are refused when the estimated round trip costs more, in bps. */
-const MAX_COST_BPS = 22;
-/** Trailing stop distance, in active-bar ATRs under the best close. */
-const TRAIL_MULT = 2.5;
-/** Share of equity one entry targets, in bps. */
-const TARGET_FRACTION_BPS = 8_500;
-/** An order may not exceed this share of the pool depth, in bps. */
-const DEPTH_CAP_BPS = 600;
+// ---- entry ----
+/** Bars of closes the sell-off is measured over (the peak window). */
+const PEAK_LOOKBACK_BARS = 180;
+/** Bars of closes the bounce off the bottom is measured over. */
+const LOW_LOOKBACK_BARS = 45;
+/** Enter only when the close is at least this far under the peak close. */
+const ENTRY_DRAWDOWN_BPS = 250;
+/** ... and has already bounced at least this far off the recent low. */
+const ENTRY_BOUNCE_BPS = 40;
+/** Share of the cash on hand one entry spends, in bps. */
+const POSITION_FRACTION_BPS = 9_000;
 /** Batches to rest after an exit before any new entry. */
-const COOLDOWN_BARS = 5;
-/** Equity drawdown from peak that exits all and locks entries, in bps. */
-const DD_GUARD_BPS = 1_800;
-/** Batch from which the guaranteed-trade fallback may fire. */
-const FALLBACK_START_SEQ = 1_200;
-/** Share of equity the fallback buys, in bps. */
-const FALLBACK_FRACTION_BPS = 1_000;
-/** Batches the fallback holds before selling. */
-const FALLBACK_HOLD_BARS = 20;
+const COOLDOWN_BARS = 180;
+
+// ---- exit (against the position's cost, fees included) ----
+/** Sell when the position is worth this much over its cost, in bps. */
+const TAKE_PROFIT_BPS = 320;
+/** Sell when the position is worth this much under its cost, in bps. */
+const STOP_LOSS_BPS = 110;
+/** The trailing exit arms once the position is worth this over cost.
+ *  Tuned to 100_000 (never arms) on the dev window's evidence: the arm at
+ *  80 armed on noise and clipped the bounces this bot exists to ride. */
+const TRAIL_ARM_BPS = 100_000;
+/** ... and sells when the close gives this back from its best, in bps. */
+const TRAIL_BPS = 80;
+/** Sell whatever is still held after this many bars in the position. */
+const TIME_STOP_BARS = 360;
+
+// ---- risk ----
+/** No new entries once equity is this far under its peak, in bps. */
+const DRAWDOWN_BRAKE_BPS = 800;
 /** Slippage caps: entries may gap a little, exits a little more. */
 const BUY_MAX_SLIPPAGE_BPS = 200;
 const SELL_MAX_SLIPPAGE_BPS = 300;
@@ -71,206 +69,89 @@ const SELL_MAX_SLIPPAGE_BPS = 300;
 const BPS = 10_000n;
 const SYMBOL = 'CBBTC';
 
-// ---- active-bar series and indicators ----
-/** Previous bar's close (any bar), to tell whether a bar is active. */
-let prevClose: bigint | null = null;
-const aHigh: number[] = [];
-const aLow: number[] = [];
-const aClose: number[] = [];
-
-interface Ema {
-  span: number;
-  warm: number[];
-  value: number | null;
-}
-const emaFast: Ema = { span: EMA_FAST_SPAN, warm: [], value: null };
-const emaSlow: Ema = { span: EMA_SLOW_SPAN, warm: [], value: null };
-
-function stepEma(e: Ema, close: number): void {
-  if (e.value !== null) {
-    e.value += (2 / (e.span + 1)) * (close - e.value);
-    return;
-  }
-  e.warm.push(close);
-  if (e.warm.length === e.span) e.value = e.warm.reduce((a, x) => a + x, 0) / e.span;
-}
-
-/** Wilder ATR over active bars: seeded by the mean of its first TRs. */
-let atrWarm: number[] = [];
-let atrValue: number | null = null;
-let prevActiveClose: number | null = null;
-
-function stepAtr(high: number, low: number, close: number): void {
-  if (prevActiveClose === null) {
-    prevActiveClose = close;
-    return;
-  }
-  const tr = Math.max(high - low, Math.abs(high - prevActiveClose), Math.abs(low - prevActiveClose));
-  prevActiveClose = close;
-  if (atrValue !== null) {
-    atrValue = (atrValue * (ATR_PERIOD - 1) + tr) / ATR_PERIOD;
-    return;
-  }
-  atrWarm.push(tr);
-  if (atrWarm.length === ATR_PERIOD) {
-    atrValue = atrWarm.reduce((a, x) => a + x, 0) / ATR_PERIOD;
-    atrWarm = [];
-  }
-}
-
-// ---- run state ----
-/** Seq of the batch the current position was first seen on. */
+/** Every close seen, warm-up bars included, oldest first. */
+const closes: bigint[] = [];
+/** Seq of the batch the current position's entry was decided on. */
 let entrySeq = -1;
-/** Best close since the position was first seen (raw price units). */
-let peakCloseInTrade = 0;
-/** Seq of the batch the last exit filled on (cooldown anchor). */
+/** Best close seen since the position was filled. */
+let peakCloseInTrade = 0n;
+/** Seq of the batch the last exit was decided on (cooldown anchor). */
 let lastExitSeq = -1;
-/** Whether any position has ever been filled (the fallback's trigger). */
-let everHeld = false;
-/** Whether the position now held is the fallback's. */
-let inFallback = false;
-/** A fallback buy has been sent but not yet seen filled. */
-let fallbackSent = false;
-/** Highest equity marked so far, and the drawdown guard's lock. */
+/** Highest equity marked so far, for the drawdown brake. */
 let peakEquity = 0n;
-let ddLocked = false;
 /** Whether a position was held at the previous batch (exit detection). */
 let wasHolding = false;
 
-/** The estimated round-trip cost, in bps, of a trade of `size` quote units at the latest depth. */
-function roundTripBps(state: BarsState, size: bigint): number | null {
-  const impact = state.impactBps(SYMBOL, size);
-  if (impact === null) return null;
-  const { fee_bps, slippage_bps } = state.hello.fees;
-  return 2 * (fee_bps + slippage_bps) + 2 * Number(impact);
+function maxOf(xs: bigint[]): bigint {
+  let m = xs[0]!;
+  for (const x of xs) if (x > m) m = x;
+  return m;
 }
 
-/** The buy size the caps allow for a target fraction of equity, in quote units. */
-function buySize(state: BarsState, fractionBps: number): bigint {
-  let size = (state.equity * BigInt(fractionBps)) / BPS;
-  const depth = state.depthAt(SYMBOL);
-  if (depth !== null && depth.length > 0) {
-    const cap = (depth[0]! * BigInt(DEPTH_CAP_BPS)) / BPS;
-    if (cap < size) size = cap;
-  }
-  if (state.cash < size) size = state.cash;
-  const room = state.weightRoom(SYMBOL);
-  if (room < size) size = room;
-  return size;
+function minOf(xs: bigint[]): bigint {
+  let m = xs[0]!;
+  for (const x of xs) if (x < m) m = x;
+  return m;
 }
 
 await runBars({
   onBatch(state: BarsState, batch) {
-    // Fold this batch's bar (a minute with no sample carries none).
+    // Record this batch's bar, if the minute had one; a minute with no
+    // sample carries no bar for the symbol and adds nothing.
     let fresh = false;
-    let active = false;
-    let close = 0;
-    let high = 0;
-    let low = 0;
     for (const bar of batch.bars) {
       if (bar.symbol !== SYMBOL) continue;
+      closes.push(BigInt(bar.c));
       fresh = true;
-      const c = BigInt(bar.c);
-      active = prevClose === null || c !== prevClose;
-      prevClose = c;
-      close = Number(bar.c);
-      high = Number(bar.h);
-      low = Number(bar.l);
     }
     if (state.equity > peakEquity) peakEquity = state.equity;
 
     const held = state.positions.get(SYMBOL);
-    if (held !== undefined) everHeld = true;
     if (wasHolding && held === undefined && entrySeq >= 0) {
+      // The position vanished since the last batch: the exit filled.
       lastExitSeq = state.seq;
       entrySeq = -1;
-      peakCloseInTrade = 0;
-      inFallback = false;
+      peakCloseInTrade = 0n;
     }
     wasHolding = held !== undefined;
 
-    // The drawdown guard reads equity, which every batch marks.
-    if (!ddLocked && peakEquity > 0n && state.equity * BPS <= peakEquity * (BPS - BigInt(DD_GUARD_BPS))) ddLocked = true;
-
     if (state.warmingUp || !fresh) return [];
-
-    // Indicators move on active bars alone; the channel is read from the
-    // active bars before this one, the EMAs and ATR after folding it in.
-    let channelHigh = 0;
-    let channelLow = 0;
-    if (active) {
-      if (aHigh.length >= DONCHIAN_K) {
-        channelHigh = Math.max(...aHigh.slice(-DONCHIAN_K));
-        channelLow = Math.min(...aLow.slice(-DONCHIAN_K));
-      }
-      aHigh.push(high);
-      aLow.push(low);
-      aClose.push(close);
-      stepEma(emaFast, close);
-      stepEma(emaSlow, close);
-      stepAtr(high, low, close);
-    }
-
-    const sellAll = (): OrderInput[] =>
-      held === undefined ? [] : [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: SELL_MAX_SLIPPAGE_BPS }];
-
-    // ---- the hard guard outranks every other rule ----
-    if (ddLocked) return held === undefined ? [] : sellAll();
+    const close = closes[closes.length - 1]!;
 
     // ---- manage the open position ----
     if (held !== undefined) {
       if (entrySeq < 0) {
+        // First batch that sees the fill: start the trade clocks.
         entrySeq = state.seq;
         peakCloseInTrade = close;
-        if (fallbackSent) {
-          inFallback = true;
-          fallbackSent = false;
-        }
       }
       if (close > peakCloseInTrade) peakCloseInTrade = close;
-      if (inFallback) {
-        if (state.seq - entrySeq >= FALLBACK_HOLD_BARS) return sellAll();
-        return [];
-      }
-      if (atrValue !== null && close < peakCloseInTrade - TRAIL_MULT * atrValue) return sellAll();
-      if (emaSlow.value !== null && close < emaSlow.value) return sellAll();
+      const value = state.value(SYMBOL, held.qty);
+      const cost = held.cost;
+      const sell: OrderInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: SELL_MAX_SLIPPAGE_BPS };
+      if (value * BPS >= cost * (BPS + BigInt(TAKE_PROFIT_BPS))) return [sell];
+      if (value * BPS <= cost * (BPS - BigInt(STOP_LOSS_BPS))) return [sell];
+      // Trailing exit: once the position's best mark is TRAIL_ARM_BPS over
+      // its cost, a TRAIL_BPS give-back from that best close ends it.
+      const peakValue = state.value(SYMBOL, held.qty, peakCloseInTrade);
+      if (peakValue * BPS >= cost * (BPS + BigInt(TRAIL_ARM_BPS)) && close * BPS <= peakCloseInTrade * (BPS - BigInt(TRAIL_BPS))) return [sell];
+      if (state.seq - entrySeq >= TIME_STOP_BARS) return [sell];
       return [];
     }
 
-    // ---- entries are decided on active bars ----
-    if (!active) return [];
+    // ---- look for an entry ----
+    if (closes.length < PEAK_LOOKBACK_BARS) return [];
     if (lastExitSeq >= 0 && state.seq - lastExitSeq < COOLDOWN_BARS) return [];
-
-    // The strategy's breakout entry.
-    if (
-      channelHigh > 0 &&
-      close > channelHigh &&
-      emaFast.value !== null &&
-      emaSlow.value !== null &&
-      emaFast.value > emaSlow.value &&
-      (close - channelLow) * 10_000 >= channelLow * MIN_RANGE_BPS
-    ) {
-      const size = buySize(state, TARGET_FRACTION_BPS);
-      if (size >= BigInt(state.hello.fees.min_notional_quote_units)) {
-        const cost = roundTripBps(state, size);
-        if (cost !== null && cost <= MAX_COST_BPS) {
-          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: size, max_slippage_bps: BUY_MAX_SLIPPAGE_BPS }];
-        }
-      }
-      return [];
-    }
-
-    // The guaranteed-trade fallback: no fill yet, late in the window.
-    if (!everHeld && state.seq >= FALLBACK_START_SEQ) {
-      const size = buySize(state, FALLBACK_FRACTION_BPS);
-      if (size >= BigInt(state.hello.fees.min_notional_quote_units)) {
-        const cost = roundTripBps(state, size);
-        if (cost !== null && cost <= MAX_COST_BPS) {
-          fallbackSent = true;
-          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: size, max_slippage_bps: BUY_MAX_SLIPPAGE_BPS }];
-        }
-      }
-    }
-    return [];
+    if (peakEquity > 0n && state.equity * BPS <= peakEquity * (BPS - BigInt(DRAWDOWN_BRAKE_BPS))) return [];
+    const peak = maxOf(closes.slice(-PEAK_LOOKBACK_BARS));
+    if (close * BPS > peak * (BPS - BigInt(ENTRY_DRAWDOWN_BPS))) return [];
+    const low = minOf(closes.slice(-LOW_LOOKBACK_BARS));
+    if (close * BPS < low * (BPS + BigInt(ENTRY_BOUNCE_BPS))) return [];
+    const notional = (state.cash * BigInt(POSITION_FRACTION_BPS)) / BPS;
+    if (notional < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+    const room = state.weightRoom(SYMBOL);
+    const spend = notional < room ? notional : room;
+    if (spend < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: BUY_MAX_SLIPPAGE_BPS }];
   },
 });
