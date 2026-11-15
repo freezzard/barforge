@@ -24,6 +24,14 @@
 //     race ranks a bot that misses the 25% drawdown bar below everyone
 //     who meets it; the brake keeps a bad day from ever nearing that).
 //
+//   - Insurance: if FALLBACK_AFTER_BARS bars pass without a single
+//     entry, the bot places one small probe trade (FALLBACK_FRACTION_BPS
+//     of cash, hard exit after FALLBACK_HOLD_BARS bars) on the first
+//     active bar, so a dead-flat race day cannot leave it with zero
+//     trades — the race ranks a zero-trade bot below everyone who
+//     traded at all. The probe can only fire when nothing has ever
+//     been opened, so it never touches a run the strategy traded.
+//
 // Every ratio test is exact bigint arithmetic on the integer closes, so
 // two runs over the same bars give the same orders byte for byte. All
 // tunables are the named constants below, in one place, so a parameter
@@ -44,6 +52,14 @@ const ENTRY_BOUNCE_BPS = 40;
 const POSITION_FRACTION_BPS = 9_000;
 /** Batches to rest after an exit before any new entry. */
 const COOLDOWN_BARS = 180;
+
+// ---- fallback probe (zero-trade insurance) ----
+/** Bars that may pass with no entry at all before the probe may fire. */
+const FALLBACK_AFTER_BARS = 1200;
+/** Share of the cash on hand the one probe trade spends, in bps. */
+const FALLBACK_FRACTION_BPS = 1_000;
+/** The probe position is closed after this many bars whatever happened. */
+const FALLBACK_HOLD_BARS = 20;
 
 // ---- exit (against the position's cost, fees included) ----
 /** Sell when the position is worth this much over its cost, in bps. */
@@ -81,6 +97,14 @@ let lastExitSeq = -1;
 let peakEquity = 0n;
 /** Whether a position was held at the previous batch (exit detection). */
 let wasHolding = false;
+/** Positions opened so far (the probe requires exactly zero). */
+let entriesOpened = 0;
+/** Whether the probe order has been placed (it fires at most once). */
+let probeFired = false;
+/** Whether the next position to appear is the probe's fill. */
+let probePending = false;
+/** Whether the position currently held is the probe. */
+let positionIsProbe = false;
 
 function maxOf(xs: bigint[]): bigint {
   let m = xs[0]!;
@@ -112,6 +136,13 @@ await runBars({
       lastExitSeq = state.seq;
       entrySeq = -1;
       peakCloseInTrade = 0n;
+      positionIsProbe = false;
+    }
+    if (!wasHolding && held !== undefined) {
+      // A fill appeared since the last batch: an entry opened.
+      entriesOpened++;
+      positionIsProbe = probePending;
+      probePending = false;
     }
     wasHolding = held !== undefined;
 
@@ -135,23 +166,51 @@ await runBars({
       // its cost, a TRAIL_BPS give-back from that best close ends it.
       const peakValue = state.value(SYMBOL, held.qty, peakCloseInTrade);
       if (peakValue * BPS >= cost * (BPS + BigInt(TRAIL_ARM_BPS)) && close * BPS <= peakCloseInTrade * (BPS - BigInt(TRAIL_BPS))) return [sell];
+      // The probe is insurance, not a trade to ride: out after
+      // FALLBACK_HOLD_BARS bars even if nothing else has triggered.
+      if (positionIsProbe && state.seq - entrySeq >= FALLBACK_HOLD_BARS) return [sell];
       if (state.seq - entrySeq >= TIME_STOP_BARS) return [sell];
       return [];
     }
 
     // ---- look for an entry ----
-    if (closes.length < PEAK_LOOKBACK_BARS) return [];
-    if (lastExitSeq >= 0 && state.seq - lastExitSeq < COOLDOWN_BARS) return [];
-    if (peakEquity > 0n && state.equity * BPS <= peakEquity * (BPS - BigInt(DRAWDOWN_BRAKE_BPS))) return [];
-    const peak = maxOf(closes.slice(-PEAK_LOOKBACK_BARS));
-    if (close * BPS > peak * (BPS - BigInt(ENTRY_DRAWDOWN_BPS))) return [];
-    const low = minOf(closes.slice(-LOW_LOOKBACK_BARS));
-    if (close * BPS < low * (BPS + BigInt(ENTRY_BOUNCE_BPS))) return [];
-    const notional = (state.cash * BigInt(POSITION_FRACTION_BPS)) / BPS;
-    if (notional < BigInt(state.hello.fees.min_notional_quote_units)) return [];
-    const room = state.weightRoom(SYMBOL);
-    const spend = notional < room ? notional : room;
-    if (spend < BigInt(state.hello.fees.min_notional_quote_units)) return [];
-    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: BUY_MAX_SLIPPAGE_BPS }];
+    let entryOrder: OrderInput | null = null;
+    if (closes.length >= PEAK_LOOKBACK_BARS
+      && !(lastExitSeq >= 0 && state.seq - lastExitSeq < COOLDOWN_BARS)
+      && !(peakEquity > 0n && state.equity * BPS <= peakEquity * (BPS - BigInt(DRAWDOWN_BRAKE_BPS)))) {
+      const peak = maxOf(closes.slice(-PEAK_LOOKBACK_BARS));
+      if (close * BPS <= peak * (BPS - BigInt(ENTRY_DRAWDOWN_BPS))) {
+        const low = minOf(closes.slice(-LOW_LOOKBACK_BARS));
+        if (close * BPS >= low * (BPS + BigInt(ENTRY_BOUNCE_BPS))) {
+          const notional = (state.cash * BigInt(POSITION_FRACTION_BPS)) / BPS;
+          if (notional >= BigInt(state.hello.fees.min_notional_quote_units)) {
+            const room = state.weightRoom(SYMBOL);
+            const spend = notional < room ? notional : room;
+            if (spend >= BigInt(state.hello.fees.min_notional_quote_units)) {
+              entryOrder = { side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: BUY_MAX_SLIPPAGE_BPS };
+            }
+          }
+        }
+      }
+    }
+    if (entryOrder !== null) return [entryOrder];
+
+    // ---- fallback probe: one small trade so a flat day cannot end
+    // with zero trades. Only reachable while flat, and only when no
+    // entry has ever opened, so a run the strategy traded is untouched.
+    if (!probeFired && entriesOpened === 0 && closes.length > FALLBACK_AFTER_BARS
+      && closes.length >= 2 && close !== closes[closes.length - 2]!) {
+      const notional = (state.cash * BigInt(FALLBACK_FRACTION_BPS)) / BPS;
+      if (notional >= BigInt(state.hello.fees.min_notional_quote_units)) {
+        const room = state.weightRoom(SYMBOL);
+        const spend = notional < room ? notional : room;
+        if (spend >= BigInt(state.hello.fees.min_notional_quote_units)) {
+          probeFired = true;
+          probePending = true;
+          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: BUY_MAX_SLIPPAGE_BPS }];
+        }
+      }
+    }
+    return [];
   },
 });
